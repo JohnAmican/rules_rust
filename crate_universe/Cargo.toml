@@ -26,7 +26,8 @@ cargo-lock = "8.0.3"
 cargo-platform = "0.1.2"
 cfg-expr = "0.13.0"
 clap = { version = "4.0.32", features = ["derive", "env"] }
-crates-index = { version = "0.18.11", default-features = false }
+# TODO: Replace with a release when https://github.com/frewsxcv/rust-crates-index/pull/100 is released
+crates-index = { git = "https://github.com/illicitonion/rust-crates-index.git", rev = "c5682e4b98adb0fd28630bc94b83e7595f5abe5e", default-features = false }
 hex = "0.4.3"
 indoc = "1.0.8"
 normpath = "1.0.1"

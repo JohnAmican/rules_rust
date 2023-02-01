@@ -1,6 +1,7 @@
 //! This module is responsible for finding a Cargo workspace
 
 pub(crate) mod cargo_config;
+mod crate_index_lookup;
 mod splicer;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +12,6 @@ use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use cargo_toml::Manifest;
-use hex::ToHex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::CrateId;
@@ -19,6 +19,7 @@ use crate::metadata::{Cargo, CargoUpdateRequest, LockGenerator};
 use crate::utils::starlark::{Label, SelectList};
 
 use self::cargo_config::CargoConfig;
+use self::crate_index_lookup::CrateIndexLookup;
 pub use self::splicer::*;
 
 type DirectPackageManifest = BTreeMap<String, cargo_toml::DependencyDetail>;
@@ -244,6 +245,7 @@ impl WorkspaceMetadata {
     }
 
     pub fn write_registry_urls_and_feature_map(
+        cargo: &Cargo,
         lockfile: &cargo_lock::Lockfile,
         features: BTreeMap<CrateId, SelectList<String>>,
         manifest_path: &SplicedManifest,
@@ -296,76 +298,75 @@ impl WorkspaceMetadata {
         let crate_indexes = index_urls
             .into_iter()
             .map(|url| {
-                let index = {
-                    // Ensure the correct registry is mapped based on the give Cargo config.
-                    let index_url = if let Some(config) = &cargo_config {
-                        if let Some(source) = config.get_source_from_url(&url) {
-                            if let Some(replace_with) = &source.replace_with {
-                                if let Some(replacement) = config.get_registry_index_url_by_name(replace_with) {
-                                    replacement
+                let index = if cargo.use_sparse_registries_for_crates_io()? && url == "https://github.com/rust-lang/crates.io-index" {
+                    CrateIndexLookup::Http(crates_index::SparseIndex::from_url("sparse+https://index.crates.io/")?)
+                } else if url.starts_with("sparse+https://") {
+                    CrateIndexLookup::Http(crates_index::SparseIndex::from_url(&url)?)
+                } else {
+                    let index = {
+                        // Ensure the correct registry is mapped based on the give Cargo config.
+                        let index_url = if let Some(config) = &cargo_config {
+                            if let Some(source) = config.get_source_from_url(&url) {
+                                if let Some(replace_with) = &source.replace_with {
+                                    if let Some(replacement) = config.get_registry_index_url_by_name(replace_with) {
+                                        replacement
+                                    } else {
+                                        bail!("Tried to replace registry {} with registry named {} but didn't have metadata about the replacement", url, replace_with);
+                                    }
                                 } else {
-                                    bail!("Tried to replace registry {} with registry named {} but didn't have metadata about the replacement", url, replace_with);
+                                    &url
                                 }
                             } else {
                                 &url
                             }
                         } else {
                             &url
-                        }
-                    } else {
-                        &url
+                        };
+
+                        // Load the index for the current url
+                        let index = crates_index::Index::from_url(index_url)
+                            .with_context(|| format!("Failed to load index for url: {index_url}"))?;
+
+                        // Ensure each index has a valid index config
+                        index.index_config().with_context(|| {
+                            format!("`config.json` not found in index: {index_url}")
+                        })?;
+
+                        index
                     };
 
-                    // Load the index for the current url
-                    let index = crates_index::Index::from_url(index_url)
-                        .with_context(|| format!("Failed to load index for url: {index_url}"))?;
-
-                    // Ensure each index has a valid index config
-                    index.index_config().with_context(|| {
-                        format!("`config.json` not found in index: {index_url}")
-                    })?;
-
-                    index
+                    CrateIndexLookup::Git(index)
                 };
-
                 Ok((url, index))
             })
-            .collect::<Result<BTreeMap<String, crates_index::Index>>>()
+            .collect::<Result<BTreeMap<String, _>>>()
             .context("Failed to locate crate indexes")?;
 
         // Get the download URL of each package based on it's registry url.
         let additional_sources = pkg_sources
             .iter()
-            .filter_map(|pkg| {
+            .map(|pkg| {
                 let source_id = pkg.source.as_ref().unwrap();
-                let index = &crate_indexes[&source_id.url().to_string()];
-                let index_config = index.index_config().unwrap();
-
-                index.crate_(pkg.name.as_str()).map(|crate_idx| {
-                    crate_idx
-                        .versions()
-                        .iter()
-                        .find(|v| v.version() == pkg.version.to_string())
-                        .and_then(|v| {
-                            v.download_url(&index_config).map(|url| {
-                                let crate_id =
-                                    CrateId::new(v.name().to_owned(), v.version().to_owned());
-                                let sha256 = pkg
-                                    .checksum
-                                    .as_ref()
-                                    .and_then(|sum| {
-                                        sum.as_sha256().map(|sum| sum.encode_hex::<String>())
-                                    })
-                                    .unwrap_or_else(|| v.checksum().encode_hex::<String>());
-                                let source_info = SourceInfo { url, sha256 };
-                                (crate_id, source_info)
-                            })
-                        })
+                let source_url = source_id.url().to_string();
+                let lookup = crate_indexes.get(&source_url).unwrap();
+                lookup.get_source_info(pkg).map(|source_info| {
+                    (
+                        CrateId::new(pkg.name.as_str().to_owned(), pkg.version.to_string()),
+                        source_info,
+                    )
                 })
             })
-            .flatten();
+            .collect::<Result<Vec<_>>>()?;
 
-        workspace_metaata.sources.extend(additional_sources);
+        workspace_metaata
+            .sources
+            .extend(
+                additional_sources
+                    .into_iter()
+                    .filter_map(|(crate_id, source_info)| {
+                        source_info.map(|source_info| (crate_id, source_info))
+                    }),
+            );
         workspace_metaata.features = features;
         workspace_metaata.inject_into(&mut manifest)?;
 
