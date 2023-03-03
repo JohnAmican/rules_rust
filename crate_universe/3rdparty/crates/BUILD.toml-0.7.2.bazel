@@ -15,7 +15,7 @@ package(default_visibility = ["//visibility:public"])
 # ])
 
 rust_library(
-    name = "libz_sys",
+    name = "toml",
     srcs = glob(["**/*.rs"]),
     compile_data = glob(
         include = ["**"],
@@ -28,21 +28,25 @@ rust_library(
         ],
     ),
     crate_features = [
-        "libc",
+        "default",
+        "display",
+        "parse",
     ],
     crate_root = "src/lib.rs",
-    edition = "2018",
+    edition = "2021",
     rustc_flags = ["--cap-lints=allow"],
     tags = [
         "cargo-bazel",
-        "crate-name=libz-sys",
+        "crate-name=toml",
         "manual",
         "noclippy",
         "norustfmt",
     ],
-    version = "1.1.8",
+    version = "0.7.2",
     deps = [
-        "@cui__libc-0.2.139//:libc",
-        "@zlib",
+        "@cui__serde-1.0.152//:serde",
+        "@cui__serde_spanned-0.6.1//:serde_spanned",
+        "@cui__toml_datetime-0.6.1//:toml_datetime",
+        "@cui__toml_edit-0.19.4//:toml_edit",
     ],
 )
